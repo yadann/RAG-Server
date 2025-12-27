@@ -4,53 +4,40 @@ const bodyParser = require('body-parser');
 const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// IMPORTANT: Add API_KEY to Render.com -> Environment Variables
-const genAI = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-app.get('/', (req, res) => res.status(200).send('Nebula Orchestrator: Online'));
+// Health Check
+app.get('/', (req, res) => {
+  res.status(200).json({ status: 'active', version: '1.4.0-stable' });
+});
 
 app.post('/', async (req, res) => {
-  const { operation, docs, messages, config } = req.body;
-  console.log(`[Gateway] Executing ${operation}...`);
-
+  const { operation, messages } = req.body;
   try {
-    if (operation === "INGEST") {
-      // Logic for chunking and vector storage goes here
-      // For now, we acknowledge receipt of documents
-      return res.json({ 
-        status: 'success', 
-        processed_chunks: (docs?.length || 0) * 8 
-      });
-    }
+    if (!process.env.API_KEY) throw new Error("API_KEY_NOT_FOUND");
+    
+    // 1. New Client Style
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
     if (operation === "QUERY") {
-      const model = genAI.models.getGenerativeModel({ 
-        model: "gemini-3-flash-preview" 
-      });
-
-      // Prepare context from chat history
       const lastMessage = messages[messages.length - 1].content;
       
-      const result = await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: lastMessage }] }],
-        systemInstruction: "You are the Nebula RAG Agent. Provide deep, technical insights based on the user data."
+      // 2. Direct Call (No getGenerativeModel)
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: lastMessage,
       });
 
-      return res.json({ 
-        answer: result.response.text(), 
-        citations: [{ id: "edge-1", metadata: { source: "Remote Orchestrator" } }] 
-      });
+      // 3. Property Access (No .text())
+      return res.json({ answer: response.text, citations: [] });
     }
-
-    res.status(400).json({ error: "Unsupported operation" });
+    
+    res.json({ status: 'success' });
   } catch (error) {
-    console.error("[Gateway Error]", error);
+    console.error("Critical Failure:", error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Orchestrator active on port ${PORT}`));
+app.listen(process.env.PORT || 3000, () => console.log("Nebula Ready"));

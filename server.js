@@ -11,7 +11,7 @@ const upload = multer();
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' })); // Increased limit for large documents
 
 // Configuration from Environment Variables
 const config = {
@@ -23,13 +23,6 @@ const config = {
   indexName: process.env.INDEX_NAME || 'clean-user'
 };
 
-// Log startup config (masking keys)
-console.log('-------------------------------------------');
-console.log(' NEBULA RAG BACKEND STARTING (ESM MODE) ');
-console.log(` Target Index: ${config.indexName}`);
-console.log(` Supabase URL: ${config.supabaseUrl}`);
-console.log('-------------------------------------------');
-
 const ai = new GoogleGenAI({ apiKey: config.geminiKey });
 const supabase = createClient(config.supabaseUrl, config.supabaseKey);
 
@@ -37,11 +30,10 @@ const supabase = createClient(config.supabaseUrl, config.supabaseKey);
  * PINECONE HELPERS
  */
 async function getPineconeHost() {
-  console.log(`[SYS] Resolving Pinecone Host for: ${config.indexName}`);
   const response = await fetch(`https://api.pinecone.io/indexes/${config.indexName}`, {
     headers: { "Api-Key": config.pineconeKey }
   });
-  if (!response.ok) throw new Error(`Pinecone host fetch failed: ${response.statusText}`);
+  if (!response.ok) throw new Error(`Pinecone unreachable: ${response.statusText}`);
   const json = await response.json();
   return json.host;
 }
@@ -59,7 +51,7 @@ async function getOpenAIEmbedding(text) {
       dimensions: 1024
     })
   });
-  if (!response.ok) throw new Error(`OpenAI embedding failed: ${response.statusText}`);
+  if (!response.ok) throw new Error(`OpenAI Embedding Error: ${response.statusText}`);
   const json = await response.json();
   return json.data[0].embedding;
 }
@@ -68,21 +60,23 @@ async function getOpenAIEmbedding(text) {
  * ENDPOINTS
  */
 
-// 1. Text Extraction (OCR/Files)
+// 1. Enhanced Extraction (OCR/PDF/Text)
 app.post('/api/extract', upload.array('files'), async (req, res) => {
-  console.log(`[IO] Extraction Request: ${req.files?.length || 0} files received.`);
+  console.log(`[IO] Extraction Request: ${req.files?.length} files`);
   try {
     const extractedDocs = [];
     for (const file of req.files) {
-      console.log(`[IO] Parsing: ${file.originalname}`);
+      console.log(`[IO] Processing: ${file.originalname} (${file.mimetype})`);
       let text = "";
-      if (file.mimetype.startsWith('image/')) {
-        console.log(`[AI] Running Vision-OCR for ${file.originalname}`);
+
+      // Use Gemini for vision (images) and PDF extraction
+      if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
+        console.log(`[AI] Running Multi-modal extraction for ${file.originalname}`);
         const result = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
           contents: {
             parts: [
-              { text: "Extract all text from this image exactly." },
+              { text: "Extract and summarize all readable text from this document accurately. Preserve structure." },
               { inlineData: { data: file.buffer.toString('base64'), mimeType: file.mimetype } }
             ]
           }
@@ -91,6 +85,7 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
       } else {
         text = file.buffer.toString('utf-8');
       }
+
       extractedDocs.push({
         id: Math.random().toString(36).substring(7),
         name: file.originalname,
@@ -99,197 +94,155 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
         size: file.size
       });
     }
-    console.log(`[IO] Extraction Success: ${extractedDocs.length} documents ready.`);
     res.json({ docs: extractedDocs });
   } catch (e) {
-    console.error(`[ERR] Extraction Error:`, e);
+    console.error(`[ERR] Extraction:`, e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// 2. Indexing (Embed + Pinecone)
+// 2. Optimized Indexing (Parallel Embeddings)
 app.post('/api/index', async (req, res) => {
-  console.log(`[SYS] Indexing Pipeline: Processing ${req.body.docs?.length} documents.`);
+  console.log(`[SYS] Indexing Phase Start.`);
   try {
     const { docs } = req.body;
     const host = await getPineconeHost();
     const vectors = [];
 
     for (const doc of docs) {
-      console.log(`[AI] Creating embeddings for: ${doc.name}`);
-      const chunks = doc.content.match(/[\s\S]{1,2000}/g) || [doc.content];
-      for (let i = 0; i < chunks.length; i++) {
-        const embedding = await getOpenAIEmbedding(chunks[i]);
-        vectors.push({
-          id: `${doc.id}-${i}`,
-          values: embedding,
-          metadata: { text: chunks[i], source: doc.name, docId: doc.id }
+      console.log(`[SYS] Processing Document: ${doc.name}`);
+      // Use a smaller chunk size for better granularity (1000 chars)
+      const chunks = doc.content.match(/[\s\S]{1,1500}/g) || [doc.content];
+      console.log(`[SYS] Generated ${chunks.length} chunks for ${doc.name}`);
+
+      // Parallelize embedding generation in small batches of 10 to avoid OpenAI rate limits
+      const BATCH_SIZE = 10;
+      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+        const currentBatch = chunks.slice(i, i + BATCH_SIZE);
+        console.log(`[SYS] Embedding progress: ${Math.round((i / chunks.length) * 100)}%`);
+        
+        const embeddingPromises = currentBatch.map(chunk => getOpenAIEmbedding(chunk));
+        const embeddings = await Promise.all(embeddingPromises);
+
+        embeddings.forEach((emb, index) => {
+          vectors.push({
+            id: `${doc.id}-${i + index}`,
+            values: emb,
+            metadata: { 
+              text: currentBatch[index], 
+              source: doc.name, 
+              docId: doc.id 
+            }
+          });
         });
       }
     }
 
-    console.log(`[SYS] Pinecone Upsert: Shipping ${vectors.length} vectors to ${host}`);
-    const upsertRes = await fetch(`https://${host}/vectors/upsert`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
-      body: JSON.stringify({ vectors })
-    });
+    // Pinecone batch upsert (limit 100 vectors per call)
+    console.log(`[SYS] Shipping ${vectors.length} vectors to Pinecone...`);
+    const P_BATCH = 100;
+    for (let i = 0; i < vectors.length; i += P_BATCH) {
+      const batch = vectors.slice(i, i + P_BATCH);
+      const upsertRes = await fetch(`https://${host}/vectors/upsert`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
+        body: JSON.stringify({ vectors: batch })
+      });
+      if (!upsertRes.ok) throw new Error(`Pinecone batch ${i} failed`);
+    }
 
-    if (!upsertRes.ok) throw new Error(`Pinecone upsert failed: ${upsertRes.statusText}`);
-    
-    console.log(`[SYS] Vector Sync Complete.`);
+    console.log(`[SYS] Vector Index Updated.`);
     res.json({ success: true, count: vectors.length });
   } catch (e) {
-    console.error(`[ERR] Indexing Error:`, e);
+    console.error(`[ERR] Indexing:`, e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// 3. Complexity Determination
+// 3. Complexity Heuristics
 app.post('/api/complexity', async (req, res) => {
-  console.log(`[AI] Analyzing data complexity heuristics...`);
   try {
     const { docCount, charCount } = req.body;
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
-      contents: `Perform heuristic analysis on dataset: 
-      Documents: ${docCount}
-      Total Characters: ${charCount}
-      
-      Determine if this dataset is SIMPLE or COMPLEX. 
-      Rules: docCount > 3 OR charCount > 10000 = COMPLEX.
-      Return the level and a concise technical reason.`,
+      contents: `Evaluate RAG dataset complexity. Docs: ${docCount}, Chars: ${charCount}. 
+      Threshold: >10,000 chars is COMPLEX. Return SIMPLE/COMPLEX and technical reason.`,
       config: {
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            level: { type: Type.STRING, description: "SIMPLE or COMPLEX" },
+            level: { type: Type.STRING },
             reason: { type: Type.STRING }
           },
           required: ["level", "reason"]
         }
       }
     });
-    console.log(`[AI] Complexity Analysis: ${response.text}`);
     res.json(JSON.parse(response.text));
   } catch (e) {
-    console.error(`[ERR] Complexity Error:`, e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// 4. Knowledge Graph Generation
+// 4. Graph Mapping
 app.post('/api/analyze_graph', async (req, res) => {
-  console.log(`[AI] Mapping Knowledge Topology...`);
   try {
     const { fullText } = req.body;
-    const snippet = fullText?.slice(0, 15000) || "";
-    
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
-      contents: `Parse semantic entities and relations from text: "${snippet}".
-      Identify core concepts as nodes and their interactions as links.
-      Rules:
-      1. Nodes must have unique IDs and a group integer (1-5).
-      2. Links must reference node IDs.
-      3. Use technical but readable labels.`,
+      contents: `Extract entities and relations from: "${fullText.slice(0, 12000)}". Format as JSON nodes/links.`,
       config: {
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            nodes: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  label: { type: Type.STRING },
-                  group: { type: Type.INTEGER }
-                },
-                required: ["id", "label", "group"]
-              }
-            },
-            links: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  source: { type: Type.STRING },
-                  target: { type: Type.STRING },
-                  relation: { type: Type.STRING },
-                  value: { type: Type.INTEGER }
-                },
-                required: ["source", "target", "relation", "value"]
-              }
-            }
+            nodes: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { id: {type: Type.STRING}, label: {type: Type.STRING}, group: {type: Type.INTEGER} }, required: ["id", "label", "group"] } },
+            links: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { source: {type: Type.STRING}, target: {type: Type.STRING}, relation: {type: Type.STRING}, value: {type: Type.INTEGER} }, required: ["source", "target", "relation", "value"] } }
           },
           required: ["nodes", "links"]
         }
       }
     });
-
-    const graph = JSON.parse(response.text);
-    console.log(`[AI] Topology Extracted: ${graph.nodes?.length} nodes, ${graph.links?.length} edges.`);
-    res.json(graph);
+    res.json(JSON.parse(response.text));
   } catch (e) {
-    console.error(`[ERR] Graph Error:`, e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// 5. RAG Query
+// 5. RAG Inference
 app.post('/api/query', async (req, res) => {
-  console.log(`[AI] RAG Inference Sequence Start.`);
   try {
     const { messages } = req.body;
     const lastUserMsg = messages[messages.length - 1].content;
-    
-    console.log(`[AI] Calculating query vector...`);
     const queryEmbedding = await getOpenAIEmbedding(lastUserMsg);
     const host = await getPineconeHost();
 
-    console.log(`[SYS] Vector Retrieval: Querying ${host}`);
     const queryRes = await fetch(`https://${host}/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
       body: JSON.stringify({ vector: queryEmbedding, topK: 5, includeMetadata: true })
     });
     const { matches } = await queryRes.json();
+    const context = matches.map(m => `[Source: ${m.metadata.source}]\n${m.metadata.text}`).join("\n\n---\n\n");
 
-    const context = matches.map(m => `[File: ${m.metadata.source}]\n${m.metadata.text}`).join("\n\n---\n\n");
-    console.log(`[AI] Context Injected: ${matches.length} matches found.`);
-    
     const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.openaiKey}`
-      },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.openaiKey}` },
       body: JSON.stringify({
         model: "gpt-4-turbo-preview",
         messages: [
-          { role: "system", content: `You are Nebula RAG Assistant. Answer based strictly on provided context. Cite sources using [Source Name].\n\nContext:\n${context}` },
+          { role: "system", content: `You are Nebula Assistant. Answer using ONLY this context:\n\n${context}` },
           ...messages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.content }))
         ]
       })
     });
     const completionJson = await completionRes.json();
-    console.log(`[AI] Inference Complete.`);
-    res.json({ 
-      answer: completionJson.choices[0].message.content, 
-      citations: matches.map(m => ({ id: m.id, metadata: { source: m.metadata.source } })) 
-    });
+    res.json({ answer: completionJson.choices[0].message.content, citations: matches.map(m => ({ id: m.id, metadata: { source: m.metadata.source } })) });
   } catch (e) {
-    console.error(`[ERR] Query Error:`, e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`[SYS] Backend Listening on ${PORT}`);
-  console.log(`[SYS] Environment Check: OK`);
-});
+app.listen(PORT, () => console.log(`[SYS] ESM Server Active on ${PORT}`));

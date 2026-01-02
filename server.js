@@ -1,10 +1,12 @@
+// server.js (ES Module version)
 
-const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-const { GoogleGenAI } = require('@google/genai');
-const { createClient } = require('@supabase/supabase-js');
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import { GoogleGenAI } from '@google/genai';
+import { createClient } from '@supabase/supabase-js';
+
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 const upload = multer();
@@ -62,8 +64,10 @@ async function getOpenAIEmbedding(text) {
 app.post('/api/extract', upload.array('files'), async (req, res) => {
   try {
     const extractedDocs = [];
+
     for (const file of req.files) {
       let text = "";
+
       if (file.mimetype.startsWith('image/')) {
         const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
         const result = await model.generateContent([
@@ -74,6 +78,7 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
       } else {
         text = file.buffer.toString('utf-8');
       }
+
       extractedDocs.push({
         id: Math.random().toString(36).substring(7),
         name: file.originalname,
@@ -82,6 +87,7 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
         size: file.size
       });
     }
+
     res.json({ docs: extractedDocs });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -133,10 +139,10 @@ app.post('/api/query', async (req, res) => {
       headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
       body: JSON.stringify({ vector: queryEmbedding, topK: 5, includeMetadata: true })
     });
-    const { matches } = await queryRes.json();
 
+    const { matches } = await queryRes.json();
     const context = matches.map(m => `[File: ${m.metadata.source}]\n${m.metadata.text}`).join("\n\n---\n\n");
-    
+
     const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -144,17 +150,18 @@ app.post('/api/query', async (req, res) => {
         "Authorization": `Bearer ${config.openaiKey}`
       },
       body: JSON.stringify({
-        model: "gpt-4-turbo-preview", // upgraded to latest stable
+        model: "gpt-4-turbo-preview",
         messages: [
           { role: "system", content: `You are a helpful assistant. Use context:\n\n${context}` },
           ...messages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.content }))
         ]
       })
     });
+
     const completionJson = await completionRes.json();
     res.json({ 
       answer: completionJson.choices[0].message.content, 
-      citations: matches.map(m => ({ id: m.id, metadata: { source: m.metadata.source } })) 
+      citations: matches.map(m => ({ id: m.id, metadata: { source: m.metadata.source } }))
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

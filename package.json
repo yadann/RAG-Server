@@ -1,0 +1,21 @@
+{
+  "name": "ai-file-server",
+  "version": "1.0.0",
+  "description": "Server for file uploads, AI embeddings, and RAG queries",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^0.1.0",
+    "@supabase/supabase-js": "^2.25.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^3.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

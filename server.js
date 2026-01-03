@@ -5,15 +5,14 @@ import multer from 'multer';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
+import crypto from 'crypto';
 
 const app = express();
 const upload = multer();
 
-// Middleware
 app.use(cors());
-app.use(express.json({ limit: '100mb' })); // Increased limit for large documents
+app.use(express.json({ limit: '100mb' }));
 
-// Configuration from Environment Variables
 const config = {
   openaiKey: process.env.OPENAI_API_KEY,
   pineconeKey: process.env.PINECONE_API,
@@ -24,16 +23,16 @@ const config = {
 };
 
 const ai = new GoogleGenAI({ apiKey: config.geminiKey });
-const supabase = createClient(config.supabaseUrl, config.supabaseKey);
 
 /**
- * PINECONE HELPERS
+ * CORE HELPERS
  */
+const getHash = (text) => crypto.createHash('sha256').update(text).digest('hex');
+
 async function getPineconeHost() {
   const response = await fetch(`https://api.pinecone.io/indexes/${config.indexName}`, {
     headers: { "Api-Key": config.pineconeKey }
   });
-  if (!response.ok) throw new Error(`Pinecone unreachable: ${response.statusText}`);
   const json = await response.json();
   return json.host;
 }
@@ -41,17 +40,9 @@ async function getPineconeHost() {
 async function getOpenAIEmbedding(text) {
   const response = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${config.openaiKey}`
-    },
-    body: JSON.stringify({
-      input: text,
-      model: "text-embedding-3-small",
-      dimensions: 1024
-    })
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.openaiKey}` },
+    body: JSON.stringify({ input: text, model: "text-embedding-3-small", dimensions: 1024 })
   });
-  if (!response.ok) throw new Error(`OpenAI Embedding Error: ${response.statusText}`);
   const json = await response.json();
   return json.data[0].embedding;
 }
@@ -60,189 +51,175 @@ async function getOpenAIEmbedding(text) {
  * ENDPOINTS
  */
 
-// 1. Enhanced Extraction (OCR/PDF/Text)
 app.post('/api/extract', upload.array('files'), async (req, res) => {
-  console.log(`[IO] Extraction Request: ${req.files?.length} files`);
   try {
     const extractedDocs = [];
     for (const file of req.files) {
-      console.log(`[IO] Processing: ${file.originalname} (${file.mimetype})`);
       let text = "";
-
-      // Use Gemini for vision (images) and PDF extraction
       if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
-        console.log(`[AI] Running Multi-modal extraction for ${file.originalname}`);
         const result = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: {
-            parts: [
-              { text: "Extract and summarize all readable text from this document accurately. Preserve structure." },
-              { inlineData: { data: file.buffer.toString('base64'), mimeType: file.mimetype } }
-            ]
-          }
+          contents: { parts: [{ text: "Extract text accurately." }, { inlineData: { data: file.buffer.toString('base64'), mimeType: file.mimetype } }] }
         });
         text = result.text;
       } else {
         text = file.buffer.toString('utf-8');
       }
-
-      extractedDocs.push({
-        id: Math.random().toString(36).substring(7),
-        name: file.originalname,
-        type: file.mimetype,
-        content: text,
-        size: file.size
-      });
+      extractedDocs.push({ id: getHash(file.originalname).slice(0, 12), name: file.originalname, content: text, type: file.mimetype, size: file.size });
     }
     res.json({ docs: extractedDocs });
-  } catch (e) {
-    console.error(`[ERR] Extraction:`, e);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 2. Optimized Indexing (Parallel Embeddings)
+// Optimized Indexing with Stable IDs and Namespace Isolation
 app.post('/api/index', async (req, res) => {
-  console.log(`[SYS] Indexing Phase Start.`);
   try {
-    const { docs } = req.body;
+    const { docs, username } = req.body;
     const host = await getPineconeHost();
+    const namespace = `user-${username}`;
     const vectors = [];
 
     for (const doc of docs) {
-      console.log(`[SYS] Processing Document: ${doc.name}`);
-      // Use a smaller chunk size for better granularity (1000 chars)
       const chunks = doc.content.match(/[\s\S]{1,1500}/g) || [doc.content];
-      console.log(`[SYS] Generated ${chunks.length} chunks for ${doc.name}`);
+      const fileHash = getHash(doc.name).slice(0, 8);
 
-      // Parallelize embedding generation in small batches of 10 to avoid OpenAI rate limits
       const BATCH_SIZE = 10;
       for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
         const currentBatch = chunks.slice(i, i + BATCH_SIZE);
-        console.log(`[SYS] Embedding progress: ${Math.round((i / chunks.length) * 100)}%`);
-        
-        const embeddingPromises = currentBatch.map(chunk => getOpenAIEmbedding(chunk));
-        const embeddings = await Promise.all(embeddingPromises);
+        const embeddings = await Promise.all(currentBatch.map(chunk => getOpenAIEmbedding(chunk)));
 
         embeddings.forEach((emb, index) => {
+          const contentHash = getHash(currentBatch[index]).slice(0, 16);
           vectors.push({
-            id: `${doc.id}-${i + index}`,
+            id: `vec_${fileHash}_${contentHash}`, // STABLE ID Strategy
             values: emb,
-            metadata: { 
-              text: currentBatch[index], 
-              source: doc.name, 
-              docId: doc.id 
-            }
+            metadata: { text: currentBatch[index], source: doc.name, docId: doc.id }
           });
         });
       }
     }
 
-    // Pinecone batch upsert (limit 100 vectors per call)
-    console.log(`[SYS] Shipping ${vectors.length} vectors to Pinecone...`);
     const P_BATCH = 100;
     for (let i = 0; i < vectors.length; i += P_BATCH) {
-      const batch = vectors.slice(i, i + P_BATCH);
-      const upsertRes = await fetch(`https://${host}/vectors/upsert`, {
+      await fetch(`https://${host}/vectors/upsert`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
-        body: JSON.stringify({ vectors: batch })
+        body: JSON.stringify({ vectors: vectors.slice(i, i + P_BATCH), namespace })
       });
-      if (!upsertRes.ok) throw new Error(`Pinecone batch ${i} failed`);
     }
-
-    console.log(`[SYS] Vector Index Updated.`);
     res.json({ success: true, count: vectors.length });
-  } catch (e) {
-    console.error(`[ERR] Indexing:`, e);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. Complexity Heuristics
-app.post('/api/complexity', async (req, res) => {
-  try {
-    const { docCount, charCount } = req.body;
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: `Evaluate RAG dataset complexity. Docs: ${docCount}, Chars: ${charCount}. 
-      Threshold: >10,000 chars is COMPLEX. Return SIMPLE/COMPLEX and technical reason.`,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            level: { type: Type.STRING },
-            reason: { type: Type.STRING }
-          },
-          required: ["level", "reason"]
-        }
-      }
-    });
-    res.json(JSON.parse(response.text));
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// 4. Graph Mapping
+// Enhanced Graph Generation with Community Summarization
 app.post('/api/analyze_graph', async (req, res) => {
   try {
-    const { fullText } = req.body;
+    const { fullText, username } = req.body;
+    const host = await getPineconeHost();
+    const communityNamespace = `community-summaries-user-${username}`;
+
+    // Step 1: Extract Entities and Cluster into Communities
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
-      contents: `Extract entities and relations from: "${fullText.slice(0, 12000)}". Format as JSON nodes/links.`,
+      contents: `Analyze this text and generate a hierarchical Knowledge Graph. 
+      Identify entities (nodes) and relations (links). 
+      Crucially: Group entities into 'communities' (logical clusters) and provide a 200-word summary for each cluster.
+      Text: "${fullText.slice(0, 15000)}"`,
       config: {
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            nodes: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { id: {type: Type.STRING}, label: {type: Type.STRING}, group: {type: Type.INTEGER} }, required: ["id", "label", "group"] } },
+            nodes: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { id: {type: Type.STRING}, label: {type: Type.STRING}, group: {type: Type.INTEGER}, summary: {type: Type.STRING} }, required: ["id", "label", "group", "summary"] } },
             links: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { source: {type: Type.STRING}, target: {type: Type.STRING}, relation: {type: Type.STRING}, value: {type: Type.INTEGER} }, required: ["source", "target", "relation", "value"] } }
           },
           required: ["nodes", "links"]
         }
       }
     });
-    res.json(JSON.parse(response.text));
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+
+    const graph = JSON.parse(response.text);
+
+    // Step 2: Index Community Summaries into Pinecone for GraphRAG
+    const communityVectors = [];
+    for (const node of graph.nodes) {
+      if (node.summary) {
+        const emb = await getOpenAIEmbedding(node.summary);
+        communityVectors.push({
+          id: `comm_${getHash(node.id).slice(0, 16)}`,
+          values: emb,
+          metadata: { text: node.summary, community_id: node.id, type: 'community_summary' }
+        });
+      }
+    }
+
+    if (communityVectors.length > 0) {
+      await fetch(`https://${host}/vectors/upsert`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
+        body: JSON.stringify({ vectors: communityVectors, namespace: communityNamespace })
+      });
+    }
+
+    res.json(graph);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 5. RAG Inference
+// Stage 1 & 2 RAG: Resolver + Answerer
 app.post('/api/query', async (req, res) => {
   try {
-    const { messages } = req.body;
+    const { messages, username, ragMode } = req.body;
     const lastUserMsg = messages[messages.length - 1].content;
-    const queryEmbedding = await getOpenAIEmbedding(lastUserMsg);
     const host = await getPineconeHost();
-
-    const queryRes = await fetch(`https://${host}/query`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
-      body: JSON.stringify({ vector: queryEmbedding, topK: 5, includeMetadata: true })
+    
+    // --- STAGE 1: RESOLVER ---
+    const resolverRes = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: `Act as a RAG Controller. Decide if this query needs context or history only.
+      Rules: If query contains technical entities or facts, context needed. If it's a greeting or pronoun follow-up, history only.
+      Return JSON: { "use_context": boolean, "resolved_task": "de-contextualized query" }
+      History: ${JSON.stringify(messages.slice(-3))}
+      Current Query: ${lastUserMsg}`,
+      config: { responseMimeType: "application/json" }
     });
-    const { matches } = await queryRes.json();
-    const context = matches.map(m => `[Source: ${m.metadata.source}]\n${m.metadata.text}`).join("\n\n---\n\n");
+    const plan = JSON.parse(resolverRes.text);
 
+    let context = "";
+    let matches = [];
+
+    if (plan.use_context) {
+      const queryEmbedding = await getOpenAIEmbedding(plan.resolved_task);
+      
+      // Determine Namespace and Retrieval Logic
+      const isGraph = ragMode === 'GRAPH' || (ragMode === 'AUTO' && messages.length > 5);
+      const targetNamespace = isGraph ? `community-summaries-user-${username}` : `user-${username}`;
+
+      const queryRes = await fetch(`https://${host}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey },
+        body: JSON.stringify({ vector: queryEmbedding, topK: 5, includeMetadata: true, namespace: targetNamespace })
+      });
+      const queryData = await queryRes.json();
+      matches = queryData.matches || [];
+      context = matches.map(m => `[Source: ${m.metadata.source || 'Community Summary'}]\n${m.metadata.text}`).join("\n\n---\n\n");
+    }
+
+    // --- STAGE 2: ANSWERER ---
     const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.openaiKey}` },
       body: JSON.stringify({
         model: "gpt-4-turbo-preview",
         messages: [
-          { role: "system", content: `You are Nebula Assistant. Answer using ONLY this context:\n\n${context}` },
+          { role: "system", content: `You are Nebula Assistant. Cite sources as [Source Name].\n\nContext:\n${context}` },
           ...messages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.content }))
         ]
       })
     });
     const completionJson = await completionRes.json();
-    res.json({ answer: completionJson.choices[0].message.content, citations: matches.map(m => ({ id: m.id, metadata: { source: m.metadata.source } })) });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    res.json({ answer: completionJson.choices[0].message.content, citations: matches.map(m => ({ id: m.id, metadata: m.metadata })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`[SYS] ESM Server Active on ${PORT}`));
+app.listen(PORT, () => console.log(`[SYS] Server Active on ${PORT}`));

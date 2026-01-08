@@ -21,22 +21,33 @@ const config = {
   indexName: process.env.INDEX_NAME || 'clean-user'
 };
 
-const ai = new GoogleGenAI({ apiKey: config.geminiKey });
+// --- DYNAMIC AI CLIENT ---
+// Instead of a global instance, we create one per request to support BYOK (Bring Your Own Key).
+const getAI = (req: any) => {
+    // Check custom header first, then fall back to env var
+    const apiKey = req.headers['x-gemini-api-key'] || config.geminiKey;
+    
+    if (!apiKey) {
+        throw new Error("No Gemini API Key provided. Please configure GOOGLE_GENAI_KEY on server or provide 'x-gemini-api-key' header.");
+    }
+    
+    return new GoogleGenAI({ apiKey });
+};
 
 /**
  * CORE HELPERS
  */
-const getHash = (text) => crypto.createHash('sha256').update(text).digest('hex');
+const getHash = (text: string) => crypto.createHash('sha256').update(text).digest('hex');
 
 async function getPineconeHost() {
   const response = await fetch(`https://api.pinecone.io/indexes/${config.indexName}`, {
-    headers: { "Api-Key": config.pineconeKey }
+    headers: { "Api-Key": config.pineconeKey || '' }
   });
-  const json = await response.json();
+  const json = await response.json() as any;
   return json.host;
 }
 
-async function getOpenAIEmbedding(text) {
+async function getOpenAIEmbedding(text: string) {
   const response = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: {
@@ -49,7 +60,7 @@ async function getOpenAIEmbedding(text) {
       dimensions: 1024
     })
   });
-  const json = await response.json();
+  const json = await response.json() as any;
   return json.data[0].embedding;
 }
 
@@ -57,9 +68,11 @@ async function getOpenAIEmbedding(text) {
  * ENDPOINTS
  */
 
-app.post('/api/extract', upload.array('files'), async (req, res) => {
+app.post('/api/extract', upload.array('files'), async (req: any, res: any) => {
   try {
+    const ai = getAI(req); // Initialize with request-specific key
     const extractedDocs = [];
+    
     for (const file of req.files) {
       let text = "";
       if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
@@ -77,7 +90,7 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
             ]
           }
         });
-        text = result.text;
+        text = result.text || "";
       } else {
         text = file.buffer.toString('utf-8');
       }
@@ -90,14 +103,17 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
       });
     }
     res.json({ docs: extractedDocs });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // Optimized Indexing with Stable IDs and Namespace Isolation
-app.post('/api/index', async (req, res) => {
+app.post('/api/index', async (req: any, res: any) => {
   try {
+    // Indexing primarily uses OpenAI (embeddings) and Pinecone, so we don't need Gemini here usually.
+    // However, if we add summarization later, use getAI(req).
+    
     const { docs, username } = req.body;
     const host = await getPineconeHost();
     const namespace = `user-${username}`;
@@ -111,7 +127,7 @@ app.post('/api/index', async (req, res) => {
       for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
         const currentBatch = chunks.slice(i, i + BATCH_SIZE);
         const embeddings = await Promise.all(
-          currentBatch.map(chunk => getOpenAIEmbedding(chunk))
+          currentBatch.map((chunk: string) => getOpenAIEmbedding(chunk))
         );
 
         embeddings.forEach((emb, index) => {
@@ -135,7 +151,7 @@ app.post('/api/index', async (req, res) => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Api-Key": config.pineconeKey
+          "Api-Key": config.pineconeKey || ''
         },
         body: JSON.stringify({
           vectors: vectors.slice(i, i + P_BATCH),
@@ -145,14 +161,15 @@ app.post('/api/index', async (req, res) => {
     }
 
     res.json({ success: true, count: vectors.length });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // Enhanced Graph Generation with Community Summarization
-app.post('/api/analyze_graph', async (req, res) => {
+app.post('/api/analyze_graph', async (req: any, res: any) => {
   try {
+    const ai = getAI(req); // Initialize with request-specific key
     const { fullText, username } = req.body;
     const host = await getPineconeHost();
     const communityNamespace = `community-summaries-user-${username}`;
@@ -200,22 +217,24 @@ Text: "${fullText.slice(0, 15000)}"`,
       }
     });
 
-    const graph = JSON.parse(response.text);
+    const graph = JSON.parse(response.text || '{}');
 
     const communityVectors = [];
-    for (const node of graph.nodes) {
-      if (node.summary) {
-        const emb = await getOpenAIEmbedding(node.summary);
-        communityVectors.push({
-          id: `comm_${getHash(node.id).slice(0, 16)}`,
-          values: emb,
-          metadata: {
-            text: node.summary,
-            community_id: node.id,
-            type: 'community_summary'
+    if (graph.nodes) {
+        for (const node of graph.nodes) {
+          if (node.summary) {
+            const emb = await getOpenAIEmbedding(node.summary);
+            communityVectors.push({
+              id: `comm_${getHash(node.id).slice(0, 16)}`,
+              values: emb,
+              metadata: {
+                text: node.summary,
+                community_id: node.id,
+                type: 'community_summary'
+              }
+            });
           }
-        });
-      }
+        }
     }
 
     if (communityVectors.length > 0) {
@@ -223,7 +242,7 @@ Text: "${fullText.slice(0, 15000)}"`,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Api-Key": config.pineconeKey
+          "Api-Key": config.pineconeKey || ''
         },
         body: JSON.stringify({
           vectors: communityVectors,
@@ -233,14 +252,15 @@ Text: "${fullText.slice(0, 15000)}"`,
     }
 
     res.json(graph);
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // Stage 1 & 2 RAG: Resolver + Answerer
-app.post('/api/query', async (req, res) => {
+app.post('/api/query', async (req: any, res: any) => {
   try {
+    const ai = getAI(req); // Initialize with request-specific key for Resolver
     const { messages, username, ragMode } = req.body;
     const lastUserMsg = messages[messages.length - 1].content;
     const host = await getPineconeHost();
@@ -256,7 +276,7 @@ Current Query: ${lastUserMsg}`,
       config: { responseMimeType: "application/json" }
     });
 
-    const plan = JSON.parse(resolverRes.text);
+    const plan = JSON.parse(resolverRes.text || '{}');
 
     let context = "";
     let matches = [];
@@ -275,7 +295,7 @@ Current Query: ${lastUserMsg}`,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Api-Key": config.pineconeKey
+          "Api-Key": config.pineconeKey || ''
         },
         body: JSON.stringify({
           vector: queryEmbedding,
@@ -285,14 +305,15 @@ Current Query: ${lastUserMsg}`,
         })
       });
 
-      const queryData = await queryRes.json();
+      const queryData = await queryRes.json() as any;
       matches = queryData.matches || [];
-      context = matches.map(m =>
+      context = matches.map((m: any) =>
         `[Source: ${m.metadata.source || 'Community Summary'}]\n${m.metadata.text}`
       ).join("\n\n---\n\n");
     }
 
     // --- STAGE 2: ANSWERER (GPT-5 NANO) ---
+    // Note: GPT-5 usage remains as requested in original code, using server-side OpenAI key.
     const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -306,7 +327,7 @@ Current Query: ${lastUserMsg}`,
             role: "system",
             content: `You are Nebula Assistant. Cite sources as [Source Name].\n\nContext:\n${context}`
           },
-          ...messages.map(m => ({
+          ...messages.map((m: any) => ({
             role: m.role === 'model' ? 'assistant' : 'user',
             content: m.content
           }))
@@ -314,17 +335,17 @@ Current Query: ${lastUserMsg}`,
       })
     });
 
-    const completionJson = await completionRes.json();
+    const completionJson = await completionRes.json() as any;
 
     res.json({
-      answer: completionJson.choices[0].message.content,
-      citations: matches.map(m => ({
+      answer: completionJson.choices?.[0]?.message?.content || "Sorry, I could not generate an answer.",
+      citations: matches.map((m: any) => ({
         id: m.id,
         metadata: m.metadata
       }))
     });
 
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
 });

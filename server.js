@@ -66,6 +66,31 @@ async function getOpenAIEmbedding(text) {
 }
 
 /**
+ * Safely parses JSON from an LLM's output, handling markdown wrappers and embedded objects.
+ */
+function parseLlmJson(text) {
+    if (!text) return {};
+    try {
+        // Handle markdown code blocks ```json ... ```
+        const cleanedText = text.replace(/^```json\s*/, '').replace(/```$/, '').trim();
+        return JSON.parse(cleanedText);
+    } catch (e1) {
+        // Handle cases where JSON is just embedded in text
+        try {
+            const match = text.match(/\{[\s\S]*\}/);
+            if (match && match[0]) {
+                return JSON.parse(match[0]);
+            }
+        } catch (e2) {
+            console.error("Failed to parse LLM JSON after multiple attempts:", text, e2);
+        }
+    }
+    console.warn("Could not parse valid JSON from LLM output:", text);
+    return {}; // Return empty on error to prevent a server crash
+}
+
+
+/**
  * ENDPOINTS
  */
 
@@ -285,7 +310,7 @@ Current Query: ${lastUserMsg}`,
       config: { responseMimeType: "application/json" }
     });
 
-    const plan = JSON.parse(resolverRes.text || '{}');
+    const plan = parseLlmJson(resolverRes.text || '');
 
     let context = "";
     let matches = [];
@@ -296,8 +321,8 @@ Current Query: ${lastUserMsg}`,
       const queryText = plan.resolved_task || lastUserMsg;
       const queryEmbedding = await getOpenAIEmbedding(queryText);
 
-      const isGraph = ragMode === 'GRAPH' ||
-        (ragMode === 'AUTO' && messages.length > 5);
+      // FIX: Align RAG mode with client-side values ('simple' vs 'complex')
+      const isGraph = ragMode === 'complex';
 
       // Select Project-Specific Namespace
       const targetNamespace = isGraph

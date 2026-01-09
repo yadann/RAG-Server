@@ -360,19 +360,27 @@ Always cite your sources.
 
 User Documents Context:
 ${context || "No relevant local documents found."}`;
+      
+      // Reconstruct history to inject system prompt, avoiding systemInstruction
+      const history = messages.slice(0, -1);
+      const current_user_message = messages[messages.length - 1];
+
+      const contentsForGemini = [
+        ...history.map(m => ({
+          role: m.role === 'model' ? 'model' : 'user',
+          parts: [{ text: m.content }]
+        })),
+        {
+          role: 'user',
+          parts: [{ text: `${systemPrompt}\n\nHuman: ${current_user_message.content}` }]
+        }
+      ];
 
       const googleRes = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: [
-            // Standard Gemini Role Mapping: 'user' | 'model'
-            ...messages.map((m) => ({
-                role: m.role === 'model' ? 'model' : 'user',
-                parts: [{ text: m.content }]
-            }))
-        ],
+        model: 'gemini-3-pro-preview', // Upgraded model for complex RAG
+        contents: contentsForGemini,
         config: {
           tools: [{ googleSearch: {} }],
-          systemInstruction: systemPrompt
         }
       });
 

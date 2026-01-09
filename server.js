@@ -108,12 +108,16 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
   }
 });
 
-// Optimized Indexing with Stable IDs and Namespace Isolation
+// Optimized Indexing with Stable IDs and PROJECT Isolation
 app.post('/api/index', async (req, res) => {
   try {
-    const { docs, username } = req.body;
+    const { docs, username, projectId } = req.body;
+    
+    if (!projectId) throw new Error("Project ID is required for indexing.");
+
     const host = await getPineconeHost();
-    const namespace = `user-${username}`;
+    // Namespace format: u_{username}_p_{projectId}
+    const namespace = `u_${username}_p_${projectId}`;
     const vectors = [];
 
     for (const doc of docs) {
@@ -157,19 +161,23 @@ app.post('/api/index', async (req, res) => {
       });
     }
 
-    res.json({ success: true, count: vectors.length });
+    res.json({ success: true, count: vectors.length, namespace });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Enhanced Graph Generation with Community Summarization
+// Enhanced Graph Generation with Community Summarization & Project Isolation
 app.post('/api/analyze_graph', async (req, res) => {
   try {
     const ai = getAI(req); // Initialize with request-specific key
-    const { fullText, username } = req.body;
+    const { fullText, username, projectId } = req.body;
+
+    if (!projectId) throw new Error("Project ID is required for graph analysis.");
+
     const host = await getPineconeHost();
-    const communityNamespace = `community-summaries-user-${username}`;
+    // Namespace format: summary_u_{username}_p_{projectId}
+    const communityNamespace = `summary_u_${username}_p_${projectId}`;
 
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
@@ -254,11 +262,14 @@ Text: "${fullText.slice(0, 15000)}"`,
   }
 });
 
-// Stage 1 & 2 RAG: Resolver + Answerer
+// Stage 1 & 2 RAG: Resolver + Answerer with Project Context
 app.post('/api/query', async (req, res) => {
   try {
     const ai = getAI(req); // Initialize with request-specific key for Resolver
-    const { messages, username, ragMode } = req.body;
+    const { messages, username, projectId, ragMode } = req.body;
+    
+    if (!projectId) throw new Error("Project ID is required for querying.");
+
     const lastUserMsg = messages[messages.length - 1].content;
     const host = await getPineconeHost();
 
@@ -284,9 +295,10 @@ Current Query: ${lastUserMsg}`,
       const isGraph = ragMode === 'GRAPH' ||
         (ragMode === 'AUTO' && messages.length > 5);
 
+      // Select Project-Specific Namespace
       const targetNamespace = isGraph
-        ? `community-summaries-user-${username}`
-        : `user-${username}`;
+        ? `summary_u_${username}_p_${projectId}`
+        : `u_${username}_p_${projectId}`;
 
       const queryRes = await fetch(`https://${host}/query`, {
         method: "POST",
@@ -309,8 +321,7 @@ Current Query: ${lastUserMsg}`,
       ).join("\n\n---\n\n");
     }
 
-    // --- STAGE 2: ANSWERER (GPT-5 NANO) ---
-    // Note: GPT-5 usage remains as requested in original code, using server-side OpenAI key.
+    // --- STAGE 2: ANSWERER ---
     const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -345,6 +356,45 @@ Current Query: ${lastUserMsg}`,
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// HARD DELETE: Remove all vectors for a project
+app.post('/api/delete_project_vectors', async (req, res) => {
+    try {
+        const { username, projectId } = req.body;
+        if (!username || !projectId) {
+            return res.status(400).json({ error: "Username and Project ID required" });
+        }
+
+        const host = await getPineconeHost();
+        
+        // Namespaces to delete
+        const namespaces = [
+            `u_${username}_p_${projectId}`,
+            `summary_u_${username}_p_${projectId}`
+        ];
+
+        // Execute deletions in parallel
+        await Promise.all(namespaces.map(ns => 
+            fetch(`https://${host}/vectors/delete`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Api-Key": config.pineconeKey || ''
+                },
+                body: JSON.stringify({
+                    deleteAll: true,
+                    namespace: ns
+                })
+            })
+        ));
+
+        res.json({ success: true, message: `Vectors deleted for project ${projectId}` });
+    } catch (e) {
+        console.error("Delete Error:", e);
+        // Don't fail the request strictly if vector delete fails (might not exist), just warn
+        res.status(200).json({ success: false, error: e.message }); 
+    }
 });
 
 const PORT = process.env.PORT || 10000;

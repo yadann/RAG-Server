@@ -1,3 +1,4 @@
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -266,7 +267,7 @@ Text: "${fullText.slice(0, 15000)}"`,
 app.post('/api/query', async (req, res) => {
   try {
     const ai = getAI(req); // Initialize with request-specific key for Resolver
-    const { messages, username, projectId, ragMode } = req.body;
+    const { messages, username, projectId, ragMode, useWebSearch } = req.body;
     
     if (!projectId) throw new Error("Project ID is required for querying.");
 
@@ -289,8 +290,11 @@ Current Query: ${lastUserMsg}`,
     let context = "";
     let matches = [];
 
-    if (plan.use_context) {
-      const queryEmbedding = await getOpenAIEmbedding(plan.resolved_task);
+    // Force context if Web Search is on (Hybrid RAG) or if Resolver says so
+    if (plan.use_context || useWebSearch) {
+      // If resolver failed but web search is on, use raw query
+      const queryText = plan.resolved_task || lastUserMsg;
+      const queryEmbedding = await getOpenAIEmbedding(queryText);
 
       const isGraph = ragMode === 'GRAPH' ||
         (ragMode === 'AUTO' && messages.length > 5);
@@ -321,37 +325,80 @@ Current Query: ${lastUserMsg}`,
       ).join("\n\n---\n\n");
     }
 
-    // --- STAGE 2: ANSWERER ---
-    const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.openaiKey}`
-      },
-      body: JSON.stringify({
-        model: "gpt-5-nano",
-        messages: [
-          {
-            role: "system",
-            content: `You are Nebula Assistant. Cite sources as [Source Name].\n\nContext:\n${context}`
-          },
-          ...messages.map((m) => ({
-            role: m.role === 'model' ? 'assistant' : 'user',
-            content: m.content
-          }))
-        ]
-      })
-    });
+    if (useWebSearch) {
+      // --- GEMINI WEB SEARCH PATH ---
+      const systemPrompt = `You are Nebula Assistant. 
+You have access to Google Search to answer the user's question with real-time information.
+You also have access to the user's uploaded documents via the context below.
+Combine both sources to provide a comprehensive answer.
+Always cite your sources.
 
-    const completionJson = await completionRes.json();
+User Documents Context:
+${context || "No relevant local documents found."}`;
 
-    res.json({
-      answer: completionJson.choices?.[0]?.message?.content || "Sorry, I could not generate an answer.",
-      citations: matches.map((m) => ({
-        id: m.id,
-        metadata: m.metadata
-      }))
-    });
+      const googleRes = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: [
+            // Standard Gemini Role Mapping: 'user' | 'model'
+            ...messages.map((m) => ({
+                role: m.role === 'model' ? 'model' : 'user',
+                parts: [{ text: m.content }]
+            }))
+        ],
+        config: {
+          tools: [{ googleSearch: {} }],
+          systemInstruction: systemPrompt
+        }
+      });
+
+      // Extract Web Citations
+      const webCitations = googleRes.candidates?.[0]?.groundingMetadata?.groundingChunks
+        ?.map((c) => c.web?.uri)
+        .filter(Boolean) || [];
+      
+      const allCitations = [
+          ...matches.map((m) => ({ id: m.id, metadata: m.metadata })),
+          ...webCitations // Strings
+      ];
+
+      res.json({
+        answer: googleRes.text || "I found some results but couldn't generate a summary.",
+        citations: allCitations
+      });
+
+    } else {
+      // --- EXISTING GPT-5-NANO PATH (Standard RAG) ---
+      const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${config.openaiKey}`
+        },
+        body: JSON.stringify({
+          model: "gpt-5-nano",
+          messages: [
+            {
+              role: "system",
+              content: `You are Nebula Assistant. Cite sources as [Source Name].\n\nContext:\n${context}`
+            },
+            ...messages.map((m) => ({
+              role: m.role === 'model' ? 'assistant' : 'user',
+              content: m.content
+            }))
+          ]
+        })
+      });
+
+      const completionJson = await completionRes.json();
+
+      res.json({
+        answer: completionJson.choices?.[0]?.message?.content || "Sorry, I could not generate an answer.",
+        citations: matches.map((m) => ({
+          id: m.id,
+          metadata: m.metadata
+        }))
+      });
+    }
 
   } catch (e) {
     res.status(500).json({ error: e.message });

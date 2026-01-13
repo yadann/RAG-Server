@@ -372,7 +372,7 @@ ${context || "No relevant local documents found."}`;
         })),
         {
           role: 'user',
-          parts: [{ text: `${systemPrompt}\n\nHuman: ${current_user_message.content}` }]
+          parts: [{ text: `${systemPrompt}\n\n${current_user_message.content}` }]
         }
       ];
 

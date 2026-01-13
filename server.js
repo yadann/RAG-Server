@@ -283,6 +283,7 @@ Text: "${fullText.slice(0, 15000)}"`,
     }
 
     if (communityVectors.length > 0) {
+      const host = await getPineconeHost();
       await fetch(`https://${host}/vectors/upsert`, {
         method: "POST",
         headers: {
@@ -390,7 +391,7 @@ ${context || "No relevant local documents found."}`;
       console.log(JSON.stringify(contentsForGemini, null, 2));
 
       const googleRes = await ai.models.generateContent({
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3-flash-preview', // Use flash model for better free-tier compatibility
         contents: contentsForGemini,
         config: {
           tools: [{ googleSearch: {} }],

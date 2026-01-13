@@ -17,6 +17,7 @@ const config = {
   openaiKey: process.env.OPENAI_API_KEY,
   pineconeKey: process.env.PINECONE_API,
   geminiKey: process.env.GOOGLE_GENAI_KEY,
+  tavilyKey: process.env.TAVILY_API_KEY,
   supabaseUrl: process.env.SUPABASE_URL,
   supabaseKey: process.env.SUPABASE_KEY,
   indexName: process.env.INDEX_NAME || 'clean-user'
@@ -332,10 +333,9 @@ Current Query: ${lastUserMsg}`,
 
     let context = "";
     let matches = [];
+    const queryText = plan.resolved_task || lastUserMsg;
 
-    // Force context if Web Search is on (Hybrid RAG) or if Resolver says so
-    if (plan.use_context || useWebSearch) {
-      const queryText = plan.resolved_task || lastUserMsg;
+    if (plan.use_context) {
       const queryEmbedding = await getOpenAIEmbedding(queryText);
       const isGraph = ragMode === 'complex';
       const targetNamespace = isGraph
@@ -355,28 +355,59 @@ Current Query: ${lastUserMsg}`,
 
       const queryData = await queryRes.json();
       matches = queryData.matches || [];
-      context = matches.map((m) =>
+      context = "--- USER DOCUMENTS CONTEXT ---\n" + matches.map((m) =>
         `[Source: ${m.metadata.source || 'Community Summary'}]\n${m.metadata.text}`
       ).join("\n\n---\n\n");
     }
 
-    // --- UNIFIED ANSWERING STAGE (using gpt-5-nano for both paths) ---
-
-    let systemPrompt;
+    // --- STAGE 2: WEB SEARCH (IF ENABLED) ---
+    let webContext = "";
+    let webCitations = [];
     if (useWebSearch) {
-      console.log('[API] "Web search" path initiated (using gpt-5-nano).');
-      systemPrompt = `You are Nebula Assistant. 
-You are a powerful AI that can answer questions with up-to-date information.
-You also have access to the user's uploaded documents via the context below.
-Combine both your internal knowledge and the document context to provide a comprehensive answer.
-Always cite document sources as [Source Name].
-
-User Documents Context:
-${context || "No relevant local documents found."}`;
-    } else {
-      console.log('[API] Standard RAG path initiated (using gpt-5-nano).');
-      systemPrompt = `You are Nebula Assistant. Cite sources as [Source Name].\n\nContext:\n${context}`;
+        console.log(`[API] Performing live web search for: "${queryText}"`);
+        try {
+            if (!config.tavilyKey) throw new Error("Tavily API key is not configured on the server.");
+            const tavilyResponse = await fetch("https://api.tavily.com/search", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    api_key: config.tavilyKey,
+                    query: queryText,
+                    max_results: 3,
+                    include_raw_content: false,
+                }),
+            });
+            if (!tavilyResponse.ok) throw new Error(`Tavily API responded with status ${tavilyResponse.status}`);
+            
+            const tavilyData = await tavilyResponse.json();
+            
+            if (tavilyData.results && tavilyData.results.length > 0) {
+                webContext = "--- REAL-TIME WEB SEARCH RESULTS ---\n" + 
+                    tavilyData.results.map(r => `[Source: ${r.url}]\n${r.content}`).join("\n\n") +
+                    "\n--- END WEB SEARCH RESULTS ---\n\n";
+                
+                webCitations = tavilyData.results.map(r => ({
+                    type: 'web',
+                    url: r.url,
+                    title: r.title,
+                }));
+                 console.log(`[API] Found ${webCitations.length} web results.`);
+            }
+        } catch (e) {
+            console.warn("[API] Tavily web search failed:", e.message);
+            webContext = "--- WEB SEARCH FAILED ---\n";
+        }
     }
+
+    // --- STAGE 3: UNIFIED ANSWERING ---
+    const fullContext = webContext + context;
+    const systemPrompt = `You are Nebula Assistant, a powerful AI.
+- Synthesize an answer from the provided context below.
+- If web search results are present, prioritize them for real-time information.
+- Cite your sources. For documents, use [Source Name]. For web pages, use the full URL as [https://...].
+
+CONTEXT:
+${fullContext || "No context was found for this query."}`;
 
     const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -399,14 +430,19 @@ ${context || "No relevant local documents found."}`;
     const completionJson = await completionRes.json();
     const finalAnswer = completionJson.choices?.[0]?.message?.content || "Sorry, I could not generate an answer.";
     
+    const allCitations = [
+        ...matches.map(m => ({ type: 'doc', id: m.id, metadata: m.metadata })),
+        ...webCitations
+    ];
+
     res.json({
       answer: finalAnswer,
-      citations: matches.map((m) => ({ id: m.id, metadata: m.metadata }))
+      citations: allCitations
     });
 
   } catch (e) {
     console.error('QUERY_API_ERROR: An unexpected error occurred in the endpoint.');
-    console.error(e); // Log the full error
+    console.error(e);
     res.status(500).json({ error: e.message, trace: e.stack });
   }
 });

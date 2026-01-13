@@ -360,77 +360,49 @@ Current Query: ${lastUserMsg}`,
       ).join("\n\n---\n\n");
     }
 
+    // --- UNIFIED ANSWERING STAGE (using gpt-5-nano for both paths) ---
+
+    let systemPrompt;
     if (useWebSearch) {
-      console.log('[API] Web search path initiated.');
-      const systemPrompt = `You are Nebula Assistant. 
-You have access to Google Search to answer the user's question with real-time information.
+      console.log('[API] "Web search" path initiated (using gpt-5-nano).');
+      systemPrompt = `You are Nebula Assistant. 
+You are a powerful AI that can answer questions with up-to-date information.
 You also have access to the user's uploaded documents via the context below.
-Combine both sources to provide a comprehensive answer.
-Always cite your sources.
+Combine both your internal knowledge and the document context to provide a comprehensive answer.
+Always cite document sources as [Source Name].
 
 User Documents Context:
 ${context || "No relevant local documents found."}`;
-      
-      console.log(`[API] System prompt constructed. Length: ${systemPrompt.length}`);
-      
-      const history = messages.slice(0, -1);
-      const current_user_message = messages[messages.length - 1];
-
-      const contentsForGemini = [
-        ...history.map(m => ({
-          role: m.role === 'model' ? 'model' : 'user',
-          parts: [{ text: m.content }]
-        })),
-        {
-          role: 'user',
-          parts: [{ text: `${systemPrompt}\n\n${current_user_message.content}` }]
-        }
-      ];
-
-      console.log('[API] Final payload for Gemini Web Search:');
-      console.log(JSON.stringify(contentsForGemini, null, 2));
-
-      const googleRes = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview', // Use flash model for better free-tier compatibility
-        contents: contentsForGemini,
-        config: {
-          tools: [{ googleSearch: {} }],
-        }
-      });
-      console.log('[API] Received response from Gemini Web Search.');
-
-      const webCitations = googleRes.candidates?.[0]?.groundingMetadata?.groundingChunks
-        ?.map((c) => c.web?.uri)
-        .filter(Boolean) || [];
-      
-      const allCitations = [
-          ...matches.map((m) => ({ id: m.id, metadata: m.metadata })),
-          ...webCitations
-      ];
-
-      res.json({
-        answer: googleRes.text || "I found some results but couldn't generate a summary.",
-        citations: allCitations
-      });
-
     } else {
-      const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.openaiKey}` },
-        body: JSON.stringify({
-          model: "gpt-5-nano",
-          messages: [
-            { role: "system", content: `You are Nebula Assistant. Cite sources as [Source Name].\n\nContext:\n${context}` },
-            ...messages.map((m) => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.content }))
-          ]
-        })
-      });
-      const completionJson = await completionRes.json();
-      res.json({
-        answer: completionJson.choices?.[0]?.message?.content || "Sorry, I could not generate an answer.",
-        citations: matches.map((m) => ({ id: m.id, metadata: m.metadata }))
-      });
+      console.log('[API] Standard RAG path initiated (using gpt-5-nano).');
+      systemPrompt = `You are Nebula Assistant. Cite sources as [Source Name].\n\nContext:\n${context}`;
     }
+
+    const completionRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.openaiKey}` },
+      body: JSON.stringify({
+        model: "gpt-5-nano",
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...messages.map((m) => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.content }))
+        ]
+      })
+    });
+
+    if (!completionRes.ok) {
+        const errorText = await completionRes.text();
+        console.error('Error from gpt-5-nano API:', errorText);
+        throw new Error(`Failed to get response from assistant AI: ${completionRes.statusText}`);
+    }
+    
+    const completionJson = await completionRes.json();
+    const finalAnswer = completionJson.choices?.[0]?.message?.content || "Sorry, I could not generate an answer.";
+    
+    res.json({
+      answer: finalAnswer,
+      citations: matches.map((m) => ({ id: m.id, metadata: m.metadata }))
+    });
 
   } catch (e) {
     console.error('QUERY_API_ERROR: An unexpected error occurred in the endpoint.');

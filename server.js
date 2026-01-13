@@ -391,11 +391,11 @@ Current Query: ${lastUserMsg}`,
                     url: r.url,
                     title: r.title,
                 }));
-                 console.log(`[API] Found ${webCitations.length} web results.`);
+                 console.log(`[API] Found ${webCitations.length} web results from sites like ${tavilyData.results[0].url}`);
             }
         } catch (e) {
             console.warn("[API] Tavily web search failed:", e.message);
-            webContext = "--- WEB SEARCH FAILED ---\n";
+            webContext = `--- WEB SEARCH FAILED: ${e.message} ---\n`;
         }
     }
 
@@ -437,7 +437,14 @@ ${fullContext || "No context was found for this query."}`;
 
     res.json({
       answer: finalAnswer,
-      citations: allCitations
+      citations: allCitations,
+      diagnostics: {
+        webSearch: {
+          used: useWebSearch,
+          query: queryText,
+          results: webCitations
+        }
+      }
     });
 
   } catch (e) {

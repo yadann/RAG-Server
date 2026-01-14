@@ -147,63 +147,104 @@ app.post('/api/ingest-drive', async (req, res) => {
         auth.setCredentials({ access_token: oauthToken });
         const drive = google.drive({ version: 'v3', auth });
 
+        // Recursive helper to flatten folders
+        const getAllFiles = async (items) => {
+            let results = [];
+            for (const item of items) {
+                let meta = item;
+                // If input is string ID, fetch metadata
+                if (typeof item === 'string') {
+                    try {
+                        const res = await drive.files.get({ fileId: item, fields: 'id, name, mimeType, size' });
+                        meta = res.data;
+                    } catch (e) {
+                         console.error(`Skipping ID ${item}: ${e.message}`);
+                         continue;
+                    }
+                }
+
+                if (meta.mimeType === 'application/vnd.google-apps.folder') {
+                    // List children
+                    let pageToken;
+                    do {
+                        const listRes = await drive.files.list({
+                            q: `'${meta.id}' in parents and trashed = false`,
+                            fields: 'nextPageToken, files(id, name, mimeType, size)',
+                            pageSize: 100,
+                            pageToken
+                        });
+                        const children = listRes.data.files || [];
+                        if (children.length > 0) {
+                            results = results.concat(await getAllFiles(children));
+                        }
+                        pageToken = listRes.data.nextPageToken;
+                    } while (pageToken);
+                } else {
+                    results.push(meta);
+                }
+            }
+            return results;
+        };
+
+        const flatFiles = await getAllFiles(fileIds);
         const docs = [];
         
-        for (const fileId of fileIds) {
-            const meta = await drive.files.get({ fileId, fields: 'id, name, mimeType, size' });
-            const name = meta.data.name || 'Untitled';
-            const mimeType = meta.data.mimeType || 'application/octet-stream';
+        for (const meta of flatFiles) {
+            const fileId = meta.id;
+            const name = meta.name || 'Untitled';
+            const mimeType = meta.mimeType || 'application/octet-stream';
 
             let content = "";
             let finalType = mimeType;
 
-            // Handle Google Docs types by exporting them
-            if (mimeType === 'application/vnd.google-apps.document') {
-                const response = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' });
-                content = response.data;
-                finalType = 'text/plain';
-            } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
-                const response = await drive.files.export({ fileId, mimeType: 'text/csv' }, { responseType: 'text' });
-                content = response.data;
-                finalType = 'text/csv';
-            } else if (mimeType === 'application/vnd.google-apps.presentation') {
-                const response = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' });
-                content = response.data;
-                finalType = 'text/plain';
-            } else {
-                // Download binary for others (PDF, etc)
-                // Note: For large PDFs, we ideally stream to extraction. 
-                // For simplicity here, we buffer, but this endpoint has 100mb limit.
-                const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
-                
-                if (mimeType === 'application/pdf') {
-                   // We need to use Gemini Vision to extract text from PDF buffer
-                   // Re-using the same logic as /api/extract essentially, but inside here.
-                   const ai = getAI(req);
-                   const base64 = Buffer.from(response.data).toString('base64');
-                   const result = await ai.models.generateContent({
-                      model: 'gemini-3-flash-preview',
-                      contents: {
-                        parts: [
-                          { text: "Extract text accurately." },
-                          { inlineData: { data: base64, mimeType: 'application/pdf' } }
-                        ]
-                      }
-                   });
-                   content = result.text || "";
+            try {
+                // Handle Google Docs types by exporting them
+                if (mimeType === 'application/vnd.google-apps.document') {
+                    const response = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' });
+                    content = response.data;
+                    finalType = 'text/plain';
+                } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
+                    const response = await drive.files.export({ fileId, mimeType: 'text/csv' }, { responseType: 'text' });
+                    content = response.data;
+                    finalType = 'text/csv';
+                } else if (mimeType === 'application/vnd.google-apps.presentation') {
+                    const response = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' });
+                    content = response.data;
+                    finalType = 'text/plain';
                 } else {
-                   // Plain text or supported
-                   content = Buffer.from(response.data).toString('utf-8');
+                    // Download binary for others (PDF, etc)
+                    const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+                    
+                    if (mimeType === 'application/pdf') {
+                    const ai = getAI(req);
+                    const base64 = Buffer.from(response.data).toString('base64');
+                    const result = await ai.models.generateContent({
+                        model: 'gemini-3-flash-preview',
+                        contents: {
+                            parts: [
+                            { text: "Extract text accurately." },
+                            { inlineData: { data: base64, mimeType: 'application/pdf' } }
+                            ]
+                        }
+                    });
+                    content = result.text || "";
+                    } else {
+                    // Plain text or supported
+                    content = Buffer.from(response.data).toString('utf-8');
+                    }
                 }
-            }
 
-            docs.push({
-                id: getHash(name + Date.now()).slice(0, 12),
-                name: name,
-                content: content,
-                type: finalType,
-                size: content.length // Approximation for text
-            });
+                docs.push({
+                    id: getHash(name + Date.now()).slice(0, 12),
+                    name: name,
+                    content: content,
+                    type: finalType,
+                    size: content.length 
+                });
+            } catch (fileErr) {
+                console.error(`Failed to download/process file ${name} (${fileId}):`, fileErr.message);
+                // Skip failed files but continue
+            }
         }
 
         res.json({ docs });

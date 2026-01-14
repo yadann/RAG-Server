@@ -7,6 +7,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 import crypto from 'crypto';
+import { google } from 'googleapis';
 
 const app = express();
 const upload = multer();
@@ -134,6 +135,82 @@ app.post('/api/extract', upload.array('files'), async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// NEW: Ingest from Drive
+app.post('/api/ingest-drive', async (req, res) => {
+    try {
+        const { oauthToken, fileIds } = req.body;
+        if (!oauthToken || !fileIds || !Array.isArray(fileIds)) throw new Error("Missing token or fileIds");
+
+        const auth = new google.auth.OAuth2();
+        auth.setCredentials({ access_token: oauthToken });
+        const drive = google.drive({ version: 'v3', auth });
+
+        const docs = [];
+        
+        for (const fileId of fileIds) {
+            const meta = await drive.files.get({ fileId, fields: 'id, name, mimeType, size' });
+            const name = meta.data.name || 'Untitled';
+            const mimeType = meta.data.mimeType || 'application/octet-stream';
+
+            let content = "";
+            let finalType = mimeType;
+
+            // Handle Google Docs types by exporting them
+            if (mimeType === 'application/vnd.google-apps.document') {
+                const response = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' });
+                content = response.data;
+                finalType = 'text/plain';
+            } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
+                const response = await drive.files.export({ fileId, mimeType: 'text/csv' }, { responseType: 'text' });
+                content = response.data;
+                finalType = 'text/csv';
+            } else if (mimeType === 'application/vnd.google-apps.presentation') {
+                const response = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' });
+                content = response.data;
+                finalType = 'text/plain';
+            } else {
+                // Download binary for others (PDF, etc)
+                // Note: For large PDFs, we ideally stream to extraction. 
+                // For simplicity here, we buffer, but this endpoint has 100mb limit.
+                const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+                
+                if (mimeType === 'application/pdf') {
+                   // We need to use Gemini Vision to extract text from PDF buffer
+                   // Re-using the same logic as /api/extract essentially, but inside here.
+                   const ai = getAI(req);
+                   const base64 = Buffer.from(response.data).toString('base64');
+                   const result = await ai.models.generateContent({
+                      model: 'gemini-3-flash-preview',
+                      contents: {
+                        parts: [
+                          { text: "Extract text accurately." },
+                          { inlineData: { data: base64, mimeType: 'application/pdf' } }
+                        ]
+                      }
+                   });
+                   content = result.text || "";
+                } else {
+                   // Plain text or supported
+                   content = Buffer.from(response.data).toString('utf-8');
+                }
+            }
+
+            docs.push({
+                id: getHash(name + Date.now()).slice(0, 12),
+                name: name,
+                content: content,
+                type: finalType,
+                size: content.length // Approximation for text
+            });
+        }
+
+        res.json({ docs });
+    } catch (e) {
+        console.error("Drive Ingest Error:", e);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // Optimized Indexing with Stable IDs and PROJECT Isolation

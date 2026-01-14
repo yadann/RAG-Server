@@ -1,4 +1,5 @@
 
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -266,16 +267,30 @@ Text: "${fullText.slice(0, 15000)}"`,
 
 
     const communityVectors = [];
+    // Dedup Set to prevent indexing the same community summary multiple times
+    const processedSummaries = new Set();
+
     if (graph.nodes) {
         for (const node of graph.nodes) {
           if (node.summary) {
+            const summaryHash = getHash(node.summary);
+            
+            // If we have already processed this exact summary text, skip it.
+            // This handles the case where the LLM assigns the same group summary to every node in the group.
+            if (processedSummaries.has(summaryHash)) {
+                continue;
+            }
+            processedSummaries.add(summaryHash);
+
             const emb = await getOpenAIEmbedding(node.summary);
             communityVectors.push({
-              id: `comm_${getHash(node.id).slice(0, 16)}`,
+              // Use summary hash for ID to ensure uniqueness across different runs if content is identical
+              id: `comm_${summaryHash.slice(0, 16)}`,
               values: emb,
               metadata: {
                 text: node.summary,
-                community_id: node.id,
+                // We use the group ID or "general" because this summary likely applies to the whole cluster, not just this specific node
+                community_id: `group_${node.group || 'general'}`,
                 type: 'community_summary'
               }
             });

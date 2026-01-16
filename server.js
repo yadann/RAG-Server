@@ -22,7 +22,11 @@ const config = {
   tavilyKey: process.env.TAVILY_API_KEY,
   supabaseUrl: process.env.SUPABASE_URL,
   supabaseKey: process.env.SUPABASE_KEY,
-  indexName: process.env.INDEX_NAME || 'clean-user'
+  indexName: process.env.INDEX_NAME || 'clean-user',
+  // Google Auth Config
+  googleClientId: process.env.GOOGLE_CLIENT_ID,
+  googlePickerApiKey: process.env.GOOGLE_PICKER_API_KEY,
+  googleAppId: process.env.GOOGLE_APP_ID
 };
 
 // --- DYNAMIC AI CLIENT ---
@@ -96,6 +100,15 @@ function parseLlmJson(text) {
 /**
  * ENDPOINTS
  */
+
+// NEW: Auth Config Endpoint
+app.get('/api/auth-config', (req, res) => {
+    res.json({
+        clientId: config.googleClientId,
+        apiKey: config.googlePickerApiKey,
+        appId: config.googleAppId
+    });
+});
 
 app.post('/api/extract', upload.array('files'), async (req, res) => {
   try {

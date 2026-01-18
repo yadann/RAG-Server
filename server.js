@@ -1,5 +1,7 @@
 
 
+
+import 'dotenv/config'; // Load .env file before anything else
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -22,7 +24,11 @@ const config = {
   tavilyKey: process.env.TAVILY_API_KEY,
   supabaseUrl: process.env.SUPABASE_URL,
   supabaseKey: process.env.SUPABASE_KEY,
-  indexName: process.env.INDEX_NAME || 'clean-user'
+  indexName: process.env.INDEX_NAME || 'clean-user',
+  // Google Auth Config
+  googleClientId: process.env.GOOGLE_CLIENT_ID,
+  googlePickerApiKey: process.env.GOOGLE_PICKER_API_KEY,
+  googleAppId: process.env.GOOGLE_APP_ID
 };
 
 // --- DYNAMIC AI CLIENT ---
@@ -96,6 +102,15 @@ function parseLlmJson(text) {
 /**
  * ENDPOINTS
  */
+
+// NEW: Auth Config Endpoint
+app.get('/api/auth-config', (req, res) => {
+    res.json({
+        clientId: config.googleClientId,
+        apiKey: config.googlePickerApiKey,
+        appId: config.googleAppId
+    });
+});
 
 app.post('/api/extract', upload.array('files'), async (req, res) => {
   try {
@@ -193,6 +208,9 @@ app.post('/api/ingest-drive', async (req, res) => {
             const fileId = meta.id;
             const name = meta.name || 'Untitled';
             const mimeType = meta.mimeType || 'application/octet-stream';
+            
+            // Try to use original file size if available, otherwise 0 for now
+            const originalSize = meta.size ? parseInt(meta.size) : 0;
 
             let content = "";
             let finalType = mimeType;
@@ -239,7 +257,8 @@ app.post('/api/ingest-drive', async (req, res) => {
                     name: name,
                     content: content,
                     type: finalType,
-                    size: content.length 
+                    // Use original size if available (e.g. for PDFs), otherwise content length (for native Docs)
+                    size: originalSize > 0 ? originalSize : content.length 
                 });
             } catch (fileErr) {
                 console.error(`Failed to download/process file ${name} (${fileId}):`, fileErr.message);
@@ -611,4 +630,15 @@ app.post('/api/delete_project_vectors', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`[SYS] Server Active on ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`[SYS] Server Active on ${PORT}`);
+    // CONFIG CHECK LOGGING
+    console.log('--- Configuration Check ---');
+    console.log('OPENAI_KEY:', config.openaiKey ? 'OK' : 'MISSING');
+    console.log('PINECONE_KEY:', config.pineconeKey ? 'OK' : 'MISSING');
+    console.log('GOOGLE_GENAI_KEY:', config.geminiKey ? 'OK' : 'MISSING');
+    console.log('GOOGLE_CLIENT_ID:', config.googleClientId ? 'OK' : 'MISSING');
+    console.log('GOOGLE_PICKER_KEY:', config.googlePickerApiKey ? 'OK' : 'MISSING');
+    console.log('GOOGLE_APP_ID:', config.googleAppId ? 'OK' : 'MISSING');
+    console.log('---------------------------');
+});

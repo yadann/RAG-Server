@@ -1,4 +1,5 @@
 
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -199,21 +200,19 @@ app.post('/api/ingest-drive', async (req, res) => {
         };
 
         const flatFiles = await getAllFiles(fileIds);
-        const docs = [];
         
-        for (const meta of flatFiles) {
-            const fileId = meta.id;
-            const name = meta.name || 'Untitled';
-            const mimeType = meta.mimeType || 'application/octet-stream';
-            
-            // Try to use original file size if available, otherwise 0 for now
-            const originalSize = meta.size ? parseInt(meta.size) : 0;
-
-            let content = "";
-            let finalType = mimeType;
-
+        // --- PARALLEL PROCESSING LOGIC ---
+        // To avoid timeouts with large folders, we process files in chunks concurrently.
+        const processFile = async (meta) => {
             try {
-                // Handle Google Docs types by exporting them
+                const fileId = meta.id;
+                const name = meta.name || 'Untitled';
+                const mimeType = meta.mimeType || 'application/octet-stream';
+                const originalSize = meta.size ? parseInt(meta.size) : 0;
+
+                let content = "";
+                let finalType = mimeType;
+
                 if (mimeType === 'application/vnd.google-apps.document') {
                     const response = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' });
                     content = response.data;
@@ -231,36 +230,44 @@ app.post('/api/ingest-drive', async (req, res) => {
                     const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
                     
                     if (mimeType === 'application/pdf') {
-                    const ai = getAI(req);
-                    const base64 = Buffer.from(response.data).toString('base64');
-                    const result = await ai.models.generateContent({
-                        model: 'gemini-3-flash-preview',
-                        contents: {
-                            parts: [
-                            { text: "Extract text accurately." },
-                            { inlineData: { data: base64, mimeType: 'application/pdf' } }
-                            ]
-                        }
-                    });
-                    content = result.text || "";
+                        const ai = getAI(req);
+                        const base64 = Buffer.from(response.data).toString('base64');
+                        const result = await ai.models.generateContent({
+                            model: 'gemini-3-flash-preview',
+                            contents: {
+                                parts: [
+                                { text: "Extract text accurately." },
+                                { inlineData: { data: base64, mimeType: 'application/pdf' } }
+                                ]
+                            }
+                        });
+                        content = result.text || "";
                     } else {
-                    // Plain text or supported
-                    content = Buffer.from(response.data).toString('utf-8');
+                        // Plain text or supported
+                        content = Buffer.from(response.data).toString('utf-8');
                     }
                 }
 
-                docs.push({
+                return {
                     id: getHash(name + Date.now()).slice(0, 12),
                     name: name,
                     content: content,
                     type: finalType,
-                    // Use original size if available (e.g. for PDFs), otherwise content length (for native Docs)
                     size: originalSize > 0 ? originalSize : content.length 
-                });
+                };
             } catch (fileErr) {
-                console.error(`Failed to download/process file ${name} (${fileId}):`, fileErr.message);
-                // Skip failed files but continue
+                console.error(`Failed to process file ${meta.name}:`, fileErr.message);
+                return null; // Return null on failure to filter out later
             }
+        };
+
+        const CONCURRENCY = 5; // Number of simultaneous downloads
+        const docs = [];
+        
+        for (let i = 0; i < flatFiles.length; i += CONCURRENCY) {
+            const chunk = flatFiles.slice(i, i + CONCURRENCY);
+            const results = await Promise.all(chunk.map(meta => processFile(meta)));
+            docs.push(...results.filter(d => d !== null));
         }
 
         res.json({ docs });
@@ -639,4 +646,3 @@ app.listen(PORT, () => {
     console.log('GOOGLE_APP_ID:', config.googleAppId ? 'OK' : 'MISSING');
     console.log('---------------------------');
 });
-    

@@ -1,7 +1,4 @@
 
-
-
-import 'dotenv/config'; // Load .env file before anything else
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -642,3 +639,4 @@ app.listen(PORT, () => {
     console.log('GOOGLE_APP_ID:', config.googleAppId ? 'OK' : 'MISSING');
     console.log('---------------------------');
 });
+    

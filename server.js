@@ -343,10 +343,13 @@ app.post('/api/analyze_graph', async (req, res) => {
     const ai = getAI(req); // Initialize with request-specific key
     const { fullText, username, projectId } = req.body;
 
-    if (!fullText || !username || !projectId) {
-        console.error('ANALYZE_GRAPH_ERROR: Missing required parameters.');
-        return res.status(400).json({ error: "Missing fullText, username, or projectId." });
+    if (!projectId) throw new Error("Project ID is required for graph analysis.");
+    
+    // Safety check for empty text
+    if (!fullText || fullText.trim().length === 0) {
+         return res.json({ nodes: [], links: [] });
     }
+
     console.log(`[API] Analyzing text for project ${projectId}. Text length: ${fullText.length}`);
 
     const response = await ai.models.generateContent({
@@ -394,24 +397,26 @@ Text: "${fullText.slice(0, 15000)}"`,
 
     console.log('[API] Raw Gemini response for graph analysis received.');
     const rawText = response.text || '{}';
-    let graph;
+    let graph = { nodes: [], links: [] };
+
     try {
-        graph = JSON.parse(rawText);
+        const parsed = JSON.parse(rawText);
+        if (parsed.nodes && Array.isArray(parsed.nodes)) graph.nodes = parsed.nodes;
+        if (parsed.links && Array.isArray(parsed.links)) graph.links = parsed.links;
     } catch (parseError) {
         console.error('ANALYZE_GRAPH_ERROR: Failed to parse JSON from Gemini response.');
         console.error('Raw Text:', rawText);
         console.error('Parse Error:', parseError);
-        // Return an empty graph to prevent client crash
-        return res.json({ nodes: [], links: [] }); 
+        // Continue with empty graph, do not crash
     }
-    console.log(`[API] Graph parsed successfully. Nodes: ${graph.nodes?.length || 0}, Links: ${graph.links?.length || 0}`);
+    console.log(`[API] Graph parsed successfully. Nodes: ${graph.nodes.length}, Links: ${graph.links.length}`);
 
 
     const communityVectors = [];
     // Dedup Set to prevent indexing the same community summary multiple times
     const processedSummaries = new Set();
 
-    if (graph.nodes) {
+    if (graph.nodes.length > 0) {
         for (const node of graph.nodes) {
           if (node.summary) {
             const summaryHash = getHash(node.summary);
@@ -617,18 +622,34 @@ app.post('/api/delete_project_vectors', async (req, res) => {
         if (!username || !projectId) {
             return res.status(400).json({ error: "Username and Project ID required" });
         }
+
         const host = await getPineconeHost();
-        const namespaces = [`u_${username}_p_${projectId}`, `summary_u_${username}_p_${projectId}`];
+        
+        // Namespaces to delete
+        const namespaces = [
+            `u_${username}_p_${projectId}`,
+            `summary_u_${username}_p_${projectId}`
+        ];
+
+        // Execute deletions in parallel
         await Promise.all(namespaces.map(ns => 
             fetch(`https://${host}/vectors/delete`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey || '' },
-                body: JSON.stringify({ deleteAll: true, namespace: ns })
+                headers: {
+                    "Content-Type": "application/json",
+                    "Api-Key": config.pineconeKey || ''
+                },
+                body: JSON.stringify({
+                    deleteAll: true,
+                    namespace: ns
+                })
             })
         ));
+
         res.json({ success: true, message: `Vectors deleted for project ${projectId}` });
     } catch (e) {
         console.error("Delete Error:", e);
+        // Don't fail the request strictly if vector delete fails (might not exist), just warn
         res.status(200).json({ success: false, error: e.message }); 
     }
 });

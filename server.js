@@ -1,5 +1,3 @@
-
-
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -343,20 +341,17 @@ app.post('/api/analyze_graph', async (req, res) => {
     const ai = getAI(req); // Initialize with request-specific key
     const { fullText, username, projectId } = req.body;
 
-    if (!projectId) throw new Error("Project ID is required for graph analysis.");
-    
-    // Safety check for empty text
-    if (!fullText || fullText.trim().length === 0) {
-         return res.json({ nodes: [], links: [] });
+    if (!fullText || !username || !projectId) {
+        console.error('ANALYZE_GRAPH_ERROR: Missing required parameters.');
+        return res.status(400).json({ error: "Missing fullText, username, or projectId." });
     }
-
     console.log(`[API] Analyzing text for project ${projectId}. Text length: ${fullText.length}`);
 
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: `Analyze this text and generate a hierarchical Knowledge Graph. 
 Identify entities (nodes) and relations (links). 
-Crucially: Group entities into 'communities' (logical clusters) and provide a 200-word summary for each cluster.
+Crucially: Group entities into 'communities' (logical clusters) and provide a 200-word summary for each cluster in German language.
 Text: "${fullText.slice(0, 15000)}"`,
       config: {
         responseMimeType: "application/json",
@@ -397,26 +392,24 @@ Text: "${fullText.slice(0, 15000)}"`,
 
     console.log('[API] Raw Gemini response for graph analysis received.');
     const rawText = response.text || '{}';
-    let graph = { nodes: [], links: [] };
-
+    let graph;
     try {
-        const parsed = JSON.parse(rawText);
-        if (parsed.nodes && Array.isArray(parsed.nodes)) graph.nodes = parsed.nodes;
-        if (parsed.links && Array.isArray(parsed.links)) graph.links = parsed.links;
+        graph = JSON.parse(rawText);
     } catch (parseError) {
         console.error('ANALYZE_GRAPH_ERROR: Failed to parse JSON from Gemini response.');
         console.error('Raw Text:', rawText);
         console.error('Parse Error:', parseError);
-        // Continue with empty graph, do not crash
+        // Return an empty graph to prevent client crash
+        return res.json({ nodes: [], links: [] }); 
     }
-    console.log(`[API] Graph parsed successfully. Nodes: ${graph.nodes.length}, Links: ${graph.links.length}`);
+    console.log(`[API] Graph parsed successfully. Nodes: ${graph.nodes?.length || 0}, Links: ${graph.links?.length || 0}`);
 
 
     const communityVectors = [];
     // Dedup Set to prevent indexing the same community summary multiple times
     const processedSummaries = new Set();
 
-    if (graph.nodes.length > 0) {
+    if (graph.nodes) {
         for (const node of graph.nodes) {
           if (node.summary) {
             const summaryHash = getHash(node.summary);
@@ -562,9 +555,12 @@ Current Query: ${lastUserMsg}`,
 
     // --- STAGE 3: UNIFIED ANSWERING ---
     const fullContext = webContext + context;
-    const systemPrompt = `You are Nebula Assistant, a powerful AI.
-- Synthesize an answer from the provided context below.
-- If web search results are present, prioritize them for real-time information.
+    const systemPrompt = `You are Nebula Assistant.
+- You are a strict RAG agent. You must answer the user's question **EXCLUSIVELY** based on the provided CONTEXT below.
+- **DO NOT** use your internal knowledge to answer questions not present in the context.
+- If the answer is not in the context, explicitly state (in German) that you cannot answer based on the provided data ("Ich kann diese Frage basierend auf den vorliegenden Dokumenten nicht beantworten").
+- If web search results are present, use them as valid context.
+- Answer in German language.
 - Cite your sources. For documents, use [Source Name]. For web pages, use the full URL as [https://...].
 
 CONTEXT:
@@ -622,34 +618,18 @@ app.post('/api/delete_project_vectors', async (req, res) => {
         if (!username || !projectId) {
             return res.status(400).json({ error: "Username and Project ID required" });
         }
-
         const host = await getPineconeHost();
-        
-        // Namespaces to delete
-        const namespaces = [
-            `u_${username}_p_${projectId}`,
-            `summary_u_${username}_p_${projectId}`
-        ];
-
-        // Execute deletions in parallel
+        const namespaces = [`u_${username}_p_${projectId}`, `summary_u_${username}_p_${projectId}`];
         await Promise.all(namespaces.map(ns => 
             fetch(`https://${host}/vectors/delete`, {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Api-Key": config.pineconeKey || ''
-                },
-                body: JSON.stringify({
-                    deleteAll: true,
-                    namespace: ns
-                })
+                headers: { "Content-Type": "application/json", "Api-Key": config.pineconeKey || '' },
+                body: JSON.stringify({ deleteAll: true, namespace: ns })
             })
         ));
-
         res.json({ success: true, message: `Vectors deleted for project ${projectId}` });
     } catch (e) {
         console.error("Delete Error:", e);
-        // Don't fail the request strictly if vector delete fails (might not exist), just warn
         res.status(200).json({ success: false, error: e.message }); 
     }
 });

@@ -75,7 +75,7 @@ async function getOpenAIEmbedding(text) {
     body: JSON.stringify({
       input: text,
       model: "text-embedding-3-small",
-      dimensions: 1536
+      dimensions: 1024 // IMPORTANT: MATCH PINECONE INDEX DIMENSION
     })
   });
   const json = await response.json();
@@ -454,6 +454,7 @@ app.post('/api/query', async (req, res) => {
     const resolverRes = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: `Act as a RAG Controller. Decide if this query needs context or history only.
+Rules: If query contains technical entities or acronyms (e.g. IKEv2), specific facts, or asks for explanations, context is REQUIRED.
 Return JSON: { "use_context": boolean, "resolved_task": "de-contextualized query" }
 History: ${JSON.stringify(messages.slice(-3))}
 Current Query: ${lastUserMsg}`,

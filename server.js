@@ -349,7 +349,7 @@ app.post('/api/analyze_graph', async (req, res) => {
     }
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-2.5-flash',
       contents: `Analyze this text and generate a hierarchical Knowledge Graph. 
 Identify entities (nodes) and relations (links). 
 Group entities into 'communities' and provide a 200-word summary for each cluster in German.
@@ -452,7 +452,7 @@ app.post('/api/query', async (req, res) => {
 
     // Stage 1: Resolver
     const resolverRes = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-2.5-flash',
       contents: `Act as a RAG Controller. Decide if this query needs context or history only.
 Rules: If query contains technical entities or acronyms (e.g. IKEv2), specific facts, or asks for explanations, context is REQUIRED.
 Return JSON: { "use_context": boolean, "resolved_task": "de-contextualized query" }
